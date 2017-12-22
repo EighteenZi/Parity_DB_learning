@@ -230,7 +230,7 @@ impl HashDB for MemoryDB {
 这是对trait HashDB的实现，功能介绍参见HashDB。
 
 ## 四. kvdb-rocksdb
-#### RocksDB
+### RocksDB
 先简单介绍下RocksDB。RocksDB是Facebook开发的一种高效数据库软件，是建立在Google的LevelDB的基础上的，可以发挥快速存储（闪存）的潜力。它是一个C++库，用于存储KV，可以是任意大小的字节流。  
 > RocksDB：A library that provides an embeddable, persistent key-value store for fast storage.
 
@@ -244,7 +244,7 @@ impl HashDB for MemoryDB {
 
 rocksdb上有wiki，如果要研究清楚rocksdb有哪些功能特性、如何使用等，需要花费较多时间，这个留待以后再深入学习。
 
-#### rust-rocksdb
+### rust-rocksdb
 由于RocksDB是C++库，Parity代码无法直接使用，于是做了一层封装，也就有了rust-rocksdb。   
 crates.io上有rust-rocksdb的crate，但是parity使用的代码应该是在此基础上做了修改，github上代码路径在[这里](https://github.com/paritytech/rust-rocksdb#getting-an-iterator)。  
 基本操作方法如下：
@@ -274,7 +274,7 @@ pub struct InMemory {
 JournalDB是我们调研的对象，也是几乎上面所有DB的集成者。   从抽象的角度来看，JournalDB相当于一种更大的数据库，将Overlay和Backing都包含进来，统一管理。从名字上来看，JournalDB是一种“日志数据库”，会将针对数据库的所有操作先记录下来，然后在适当的时候将所有操作汇总成batch发送给Backing，由Backing执行这些操作。这样的好处是批量操作，效率高。JournalDB可以有不同的实现，Overlay和Backing各自存储什么内容、彼此之间如何交互，可以根据需求有各种各样的实现方式，所以才会有ArchiveDB、EarlyMergeDB等，不止这4种实现，可以存在很多种方式。  
 缓存是个很普遍的概念。总体上来说，Overlay相当于Backing的缓存，两者之间存在同步的问题。每一层上还可能有自己的缓存，比如说，rocksdb是最底层的数据库，它维护着自己的缓存；kvdb-rocksdb是对rocksdb的封装，它也有自己的缓存，write_buffered就是写入自己的缓存中，而不是写入rocksdb的缓存中。所以说，整个的存储结构是比较复杂的。  
 
-#### JournalDB
+### JournalDB
 JournalDB是一个trait，它的实现依赖于trait HashDB的实现，它本身也可以认为是一种HashDB。  
 ```
 /// A `HashDB` which can manage a short-term journal potentially containing many forks of mutually
@@ -359,7 +359,7 @@ pub trait JournalDB: HashDB {
 > 备注：  
 	一般来说，数据库是通用的，所以era和id可以是任意数据，只要有era是随着时间增长的，id可以唯一的标识数据项。具体到代码的使用中，era是块的高度，id使用的是块 header的hash。
 
-#### OverlayDB
+### OverlayDB
 OverlayDB是最基础的DB，有着原始的存储模型：1个Overlay，1个Backing。在Parity代码中它并没有被使用，似乎是为其他DB打基础。
 1. 结构体
 ```
@@ -480,7 +480,7 @@ OverLayDB的操作是比较简洁的，存储模型总结如下：
 从名字上来看，“OverlayDB”，是指基本操作都是在Overlay上进行操作的DB，只有调用commit之后才会写入硬盘数据库。这种操作模式有些类似于Git，先在本地(MemoryDB)进行修改，然后再提交到仓库(KeyValueDB)中去。其实所有的JournalDB应该都是这种操作模式，只是具体操作细节不太相同。  
 
 
-#### ArchiveDB
+### ArchiveDB
 ArchiveDB是在OverlayDB的基础上做了些改进，是个实际可用的JournalDB。
 
 1. 结构体
