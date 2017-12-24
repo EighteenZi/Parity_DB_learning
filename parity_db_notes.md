@@ -600,7 +600,335 @@ backing中存储的内容，需要注意是：
 
 顾名思义，ArchiveDB，是会将所有数据都进行存档的数据库。操作模式也是类似于Git，先在Overlay上进行修改，然后写入backing中由backing去处理。
 
+### OverlayRecentDB
+OverlayRecentDB相对于前两个DB，是复杂了很多，我们先分析文件的注释，然后分析代码。引用格式的文字是对源文件的翻译，紧接着的文字是分析。
+
+#### 注释说明
+1. 简介
+> OverlayRecentDB: 'JournalDB' over in-memory overlay  
+
+OverlayRecentDB在overlay中有一个DB用来存储Journal。这里的Journal的内容类似于快照，详细解释参见下面的分析。  
+> OverlayRecentDB跟OverlayDB一样，有一个memory overlay；需要主动调用commit才会将数据写入disk；OverlayDB的Overlay和Backing的交互模型比较简单，所有操作都先在Overlay上进行，remove等操作是直接在Overlay上操作的，所以会立即生效，这里remove不会立即生效，但是有些年代（基本是线性的，但是没有确定的规律，比较随机）的数据可能在remove之前就已经被删除了。
+
+2. 总体结构  
+> OverlayRecentDB有2个memory overlay：transaction overlay和history overlay。Transaction overlay包含了当前的transaction data，会在commit的时候合并入history overlay；History overlay包含了hisory period的所有数据，在commit的时候，如果其中的node已经变成ancient，会被写入disk。  
+
+可以看出这是2层overlay，上层是transaction overlay，缓存了transaction；下层是history overlay。在commit的时候transaction overlay会先merge到history overlay，然后history overlay中ancient的node会被写入disk。可以参见下图。  
+```
+graph TB
+A(Transaction Overlay).->B[Transactions]
+B-->C[History]
+D(History Overlay).->C
+C-->E[Disk]
+```
+
+> 另外，内存中还维护着1个journal，也会存入disk，它里面包含了history period中所有的insertions和removals，下面的图示是根据JournalEntry结构体画的。这个是用来跟踪那些已经超过history scope但是必须被写入disk的data nodes。
+
+这一部分是区别与OverlayDB和AchiveDB的根本，详细内容参见下面。  
+
+3. commit流程
+> Commit流程如下：
+> * 根据transaction overlay创建1个新的journal record
+> * 将transaction overlay中的所有node插入history  overlay，如果已经存在的话，就增加引用计数rc
+> * 清除 transaction overlay
+> * 对于1个canonical的journal record，如果它变成ancient，将其中的insertions写入disk
+> * 对于每1个journal record，如果超出了history scope，也就是变成ancient，将它在history overlay中的insertions删除，降低引用计数rc，如果rc==0，删除这个entry，
+> * 对于1个canonical的Journal record，如果它变成ancient，遍历其中的removals，如果key不在history overlay中，清理掉这条removal
+> * 将ancient record从Memory和disk中清除掉。
+
+4. 总结  
+根据注释能够稍微有所了解，但是没有细节，对于整个的流程是比较困惑的。Transaction Overlay，History Overlay，Journal，Disk，各自存储什么内容，彼此之间如何进行交互？这些是接下来在看代码的过程中要掌握的。
+
+#### 代码说明
+1. 结构体
+```
+pub struct OverlayRecentDB {
+	transaction_overlay: MemoryDB,
+	backing: Arc<KeyValueDB>,
+	journal_overlay: Arc<RwLock<JournalOverlay>>,
+	column: Option<u32>,
+}
+```
+看上去只比OverlayDB多了一个journal_overlay，但是这个journal_overlay是个比较复杂的东西。注释中说过，OverlayRecentDB有2个overlay和1个journal，但是在结构体中只看到1个transaction overlay和1个journal_overlay，那么journal_overlay应该是包含History overlay和Journal的内容的。  
+下面看一下JournalOverlay的结构。  
+```
+#[derive(PartialEq)]
+struct JournalOverlay {
+	backing_overlay: MemoryDB, // Nodes added in the history period
+	pending_overlay: H256FastMap<DBValue>, // Nodes being transfered from backing_overlay to backing db
+	journal: HashMap<u64, Vec<JournalEntry>>,
+	latest_era: Option<u64>,
+	earliest_era: Option<u64>,
+	cumulative_size: usize, // cumulative size of all entries.
+}
+```
+JournalOverlay是个比较复杂的结构，里面有3个HashMap（MemoryDB也是）和2个era:
+* backing_overlay是MemoryDB，就是之前说的History Overlay；
+* pending_overlay似乎是backing_overlay与backing db之间的缓冲；
+* journal的HashMap中Value是JournalEntry的Vector，这个是记录Journal record的，每次commit的时候都会有1个journal record。
+* latest_era和earliest_era是用来保持History的，相当于2个指针，有点类似于环形缓冲区的2个指针，是用来维持History的。
+* cumulative_size是用来统计backing_overlay中insertions的Value的累计长度，后面会说明一下是怎么计算的。
+
+JournalEntry结构体如下所示，里面包含id，insertions，deletions，后两个都是key的Vector。
+```
+#[derive(PartialEq)]
+struct JournalEntry {
+	id: H256,
+	insertions: Vec<H256>,
+	deletions: Vec<H256>,
+}
+```
+
+2. 方法
+JournalEntry实现了HeapSizeOf trait，能够获取堆内存占用大小  
+OverlayRecentDB实现了Clone trait，能够直接clone  
+```
+impl OverlayRecentDB {
+	/// Create a new instance.
+	pub fn new(backing: Arc<KeyValueDB>, col: Option<u32>) -> OverlayRecentDB {}
+
+	#[cfg(test)]
+	fn can_reconstruct_refs(&self) -> bool {}
+
+	fn payload(&self, key: &H256) -> Option<DBValue> {}
+
+	fn read_overlay(db: &KeyValueDB, col: Option<u32>) -> JournalOverlay {}
+}
+```
+
+OverlayRecentDB自身实现的方法比较少，有new、payload、read_overlay、can_reconstruct_refs，功能也比较好理解：
+* new：新建一个OverlayRecentDB实例，也可以理解为初始化；
+* onstruct_refs：判断能否重构journal_overlay成功；
+* payload：从硬盘中根据key获取value；
+* read_overlay：从硬盘中获取信息来构建journal_overlay，供new使用。
+
+从上面这些操作的实现中可以推导出很多内容：  
+* new的实现  
+OverlayRecentDB里面包含4项数据：transaction_overlay，backing，journal_overlay，column。这些项中，backing和column是方法入参传入进来的，transaction_overlay是新建的MemoryDB，只有journal_overlay是从backing中通过调用read_overlay方法读取出来的，下面看read_overlay的实现。
+
+* read_overlay的实现  
+read_overlay的目的是构建出JournalOverlay出来。JournalOverlay中包含6项：backing_overlay，pending_overlay，journal，latest_era，earliest_era，cumulative_size。其中pending_overlay是新构造的HashMap。我们先看流程，再分析每个数据项的由来。流程如下：  
+步骤1：初始化journal、overlay、latest_era、earliest_era、cumulative_size；  
+步骤2：根据LATEST_ERA_KEY作为key从db中取出value来，RLP解码之后就是era，也就是latest_era；  
+步骤3：根据era、index、PADDING进行RLP编码来构造key，从db中取数据，取出的value也是RLP编码格式，里面有id、insertions、deletions，从insertions中取出k和v放入overlay中，同时在cumulative_size中累计value的长度，根据insertions和deletions构造JournalEntry，放入journal中。  
+步骤4：index+=1，进入步骤3。这样会取出同一个era下的所有的insertions和deletions放入overlay和journal中。  
+步骤5：era-=1，进入步骤3和4。这样会取出所有记录的era下的insertions和deletions。最后的那个era作为earliest_era。  
+步骤6：根据上面的流程中得到的journal、overlay、latest_era、earliest_era、cumulative_size，再新建一个pending_overlay，构造一个JournalOverlay返回。  
+
+根据流程可以推导出存储在db中的一些数据的信息：  
+*  latest_era：  
+内存中：Some(u64)；  
+db中存储：key是LATEST_ERA_KEY，value是latest_era的RLP编码  
+* journal的存储：  
+内存中：journal是一个HashMap<u64, Vec<JournalEntry>>，entry中的value是JournalEntry的Vector。换句话说，1个journal的entry对应一个era下所有的记录，包含一系列的JournalEntry，JournalEntry之间根据id进行区分，里面包含着insertions和deletions。  
+db中存储：如下图所示，era和index合起来作为1条JournalEntry存储时的key，PADDING是10个字节的0，era是8个字节，index是4个字节，所以在journal_overlay中查找时用的key都需要经过to_short_key处理，取前12个字节。  
+需要注意的是：  
+a) id和index不是同一个数据，id用来区分每一个entry（代码调用时id的值是header的hash），index是entry的个数。  
+b) 内存中JournalEntry的insertions是Vector<H264>，即不包含value的（value存在overlay中），而在db中存储的insertions是包含value的。
+
+![image](https://github.com/EighteenZi/Parity_DB_learning/blob/master/JournalEntry_storage_struct.png?raw=true)
+
+* payload的实现
+payload的功能是根据key从db中取出value。
+从实现中可以看出：数据在db中是按照如下格式存储的：  
+```
+graph LR
+A(key: H264)-->B(value:Transactions)
+```
+DBValue是如下类型：
+```
+pub type DBValue = ElasticArray128<u8>;
+```
+* can_reconstruct_refs的实现
+调用read_overlay重新构建journal_overlay，然后与内存中保存的journal_overlay对比，判断是否一致。  
+这个方法只是测试使用。
+
+3. JournalDB方法
+```
+impl JournalDB for OverlayRecentDB {
+	fn boxed_clone(&self) -> Box<JournalDB> {}
+
+	fn mem_used(&self) -> usize {}
+
+	fn journal_size(&self) -> usize {}
+
+	fn is_empty(&self) -> bool {}
+
+	fn backing(&self) -> &Arc<KeyValueDB> {}
+
+	fn latest_era(&self) -> Option<u64> { self.journal_overlay.read().latest_era }
+
+	fn earliest_era(&self) -> Option<u64> { self.journal_overlay.read().earliest_era }
+
+	fn state(&self, key: &H256) -> Option<Bytes> {}
+
+	fn journal_under(&mut self, batch: &mut DBTransaction, now: u64, id: &H256) -> Result<u32, UtilError> {}
+
+	fn mark_canonical(&mut self, batch: &mut DBTransaction, end_era: u64, canon_id: &H256) -> Result<u32, UtilError> {}
+
+	fn flush(&self) {}
+
+	fn inject(&mut self, batch: &mut DBTransaction) -> Result<u32, UtilError> {}
+
+	fn consolidate(&mut self, with: MemoryDB) {}
+}
+```
+JournalDB方法较多，不像HashDB那样容易分类，有：
+* boxed_clone：返回一份数据库的拷贝
+* mem_used：堆内存占用大小
+* is_empty： 判断数据库是否为空
+* journal_size：返回journal大小
+* backing：获取backing
+* latest_era：获取latest_era
+* earliest_era：后去earliest_era
+* state: 根据key的前缀获取value
+* flush：清理缓存
+* inject：填写batch
+* consolidate：合并transaction_overlay
+* journal_under：填写batch
+* mark_canonical：
+
+下面一一介绍实现方法，以及我们从实现当中推导出的信息。  
+1）boxed_clone的实现  
+OverlayRecentDB已经实现了trait Clone，所以直接调用clone方法即可。
+
+2）mem_used的实现  
+获取堆内存占用大小，会累计transaction_overlay，journal_overlay中的backing_overlay、pending_overlay、journal的大小。缓存结构也是由这4个HashMap组成的。
+
+3）journal_size  
+直接返回journal_overlay中的cumulative_size。之前在OverlayRecentDB：：new的时候，会计算写入journal_overlay.backing_overlay中value的长度，后续是如何维持的，还需要接着看下面的代码。
+
+4）is_empty  
+判断数据库是否为空，使用的方法是去backing中获取LATEST_ERA_KEY。
+这样的实现方法，说明latest_era起着关键性的作用。latest_era的写入机制需要继续分析。
+
+5）backing、latest_era、earliest_era  
+这3个方法很简单，只是获取backing、latest_era、earliest_era.
+
+6）state  
+这个方法的使用还不是特别清楚。  
+流程是：  
+先将key截短，取前12bytes，即era+index；  
+在journal_overlay的backing_overlay上查找；  
+如果找不到，在journal_overlay的pending_overlay上查找；  
+如果找不到，在backing中调用get_by_prefix查找。  
+  
+这个方法结合read_overlay，我们知道了transaction_overlay和journal_overlay中的key的不同，journal_overlay中的key是12字节长的，是由8字节的era和4字节的index组成的。
+
+7）journal_under的实现  
+要想理解OverlayRecentDB的真正内涵，最需要搞明白的就是journal_under和mark_canonical。
+Journal_under的流程如下：  
+步骤1. 获取journal_overlay；  
+步骤2. 清掉journal_overlay的pending_overlay  
+步骤3. 取出transaction_overlay的所有数据，将所有rc>0的key放入inserted_keys数组中，将所有rc<0的key放入removed_keys数组中;将所有rc>0的key和Value放入insertions数组中；  
+步骤4. 根据id、insertions、removed_keys进行RLP编码，构建db中存储的Value。  
+构建的过程中insertions的构建是较复杂的（参考图七），将insertions中每一条insertion的k和v取出：  
+1）参与到RLP编码中，
+2）更新journal_overlay.cumulative_size，
+3）放入journal_overlay.backing_overlay中。  
+步骤5. 根据era、index、PADDING进行RLP编码，构建db存储中的key  
+		   index是当前Journal中entries的数目，PADDING就是10个字节的0.
+		步骤6. 对key和Value使用put_vec方法放入batch中
+		步骤7. 更新latest_era和earliest_era
+		步骤8. 新增journal的entry。
+
+总结一下，journal_under方法中，会有一系列的操作，图三和图四中的数据基本都会涉及。首先，journal_overlay.pending_overlay会被清空；然后transaction_overlay中的数据会被取出，然后被打成各种包放入backing_overlay、journal、disk中，放入3个地方的内容是不同的：backing_overlay中放入short_key和value；journal中放入insertions和deletions，insertions中没有value；disk中放入rlp编码的key和value，具体内容参见图七。更新backing_overlay的时候会更新cumulative_size。然后根据era更新latest_era和earliest_era。  
+每次journal_overlay的journal都会插入1个JournalEntry，1个era对应1系列的JournalEntry。
+
+8）mark_canonical  
+入参有end_era，canon_id，流程如下：  
+步骤1. 取出journal_overlay；  
+步骤2. 从journal_overlay.journal中取出end_era下包含的所有JournalEntry，然后开始遍历：  
+		a. 删除db中的JournalEntry记录（图七）；  
+b. 初始化canon_insertions、canon_deletions、overlay_deletions；  
+c. 如果journalEntry.id等于canon_id，  
+将JournalEntry中的insertions全部取出，开始遍历：  
+根据insertion中的key在backing_overlay中获取出value和rc，如果rc>0，放入canon_insertions中；  
+将JournalEntry中的deletions放入canon_deletions中；  
+步骤3. 将JournalEntry中的deletions放入overlay_deletions；  
+步骤4. 将canon_insersions中的数据放入batch中重新插入，同时也在pending_overlay中放置一份；  
+步骤5. 根据overlay_deletions，更新backing_overlay和cumulative_size  
+步骤6. 根据canon_deletions，如果backing_overlay不再包含指定的key，在db中也删除  
+步骤7. 删除journal中end_era对应的所有JournalEntry  
+步骤8. 更新earliest_era  
+		
+9）总结：  
+每次journal_under，在db中都是插入如图七所示的数据，包含所有的insertions和deletions，如果有多次journal_under，每次db中存储的数据根据index作为区分。
+最后在mark_canonical的时候会将db中指定era的所有记录的数据删除，重新插入指定id的一次记录，然后由db来执行。
+
+4. HashDB方法
+```
+impl HashDB for OverlayRecentDB {
+	fn keys(&self) -> HashMap<H256, i32> {}
+
+	fn get(&self, key: &H256) -> Option<DBValue> {}
+
+	fn contains(&self, key: &H256) -> bool {}
+
+	fn insert(&mut self, value: &[u8]) -> H256 {}
+	fn emplace(&mut self, key: H256, value: DBValue) {}
+	fn remove(&mut self, key: &H256) {}
+}
+```
+HashDB方法包含基本的插入（insert、emplace），删除（remove），获取（keys、get、contains）等接口。  
+* 2个插入操作：  
+		insert是插入value，返回key；  
+		emplace是插入key和value，没有返回值。  
+* 1个删除操作：  
+		remove  
+		注：insert、emplace、remove等3个操作都是在transaction_overlay上操作的。  
+* 3个获取操作：  
+		keys：获取所有的key及其引用计数，形成一个HashMap返回；  
+		get： 根据key找到Value；  
+		contains：判断是否包含key。
+
+1）keys的实现  
+遍历backing中指定column下所有的key，引用计数都设为1，形成HashMap；  
+遍历transaction_overlay，获取所有的key，在HashMap的基础上插入。  
+2）get的实现  
+先在transaction_overlay中查找，如果rc>0，直接返回相应的Value；  
+再去journal_overlay中的backing_overlay中查找；  
+如果没有找到，再去journal_overlay的pending_overlay中查找；  
+如果没有找到，去backing中查找。
+
+可见OverlayRecentDB有很多层缓冲。  
+另外，transaction_overlay中的key与journal_overlay中的key不同，后者是前者的头12bytes，所以叫short_key。
+
+### EarlyMergeDB & RefCountedDB
+这2个DB与OverlayRecentDB有些相似，也会在DB上存储Journal，只是具体操作的方式不同。
+
+### JournalDB的使用 
+
+JournalDB中最关键的功能是journal_under，即将Overlay中的数据取出放入batch中；与prune相关的功能是mark_canonical。在代码中journal_under和mark_canonical有多处调用，这里选择一个典型的例子：commit_block：  
+commit_block的流程如下：  
+->新建batch；  
+-> check_epoch_end_signal: 修改header等并在batch中新添操作；  
+-> journal_under: 将JournalDB中的内容添加到batch；  
+-> chain.insert_block: 将block的数据添加batch；  
+-> traced.read().import: 将tracedb中的内容添加到batch；  
+-> db.read().write_buffered: 写入db的buffer中；  
+-> chain.commit: chain数据的整理  
+-> check_epoch_end:   
+-> update_last_hashes: 更新hash  
+-> prune_anient：清理state。  
+
+这个流程中跟JournalDB紧密相关的是journal_under、prune_anient。journal_under比较简单，就是将Overlay中的数据写入batch中。
 
 
 
+下面看一下prune_anient的流程。  
+->获取latest_era；  
+->进入循环  
+  ->判断是否需要pruning  
+  ->获取earliest_era，判断是否 earliest_era + history <= latest_era  
+    ->如果是，新建batch  
+    ->jounal_db.mark_canonical  
+    ->db.read().write_buffered(batch)： 将batch写入数据库的buffer  
+    ->journal_db.flush: 调用journal_db的flush函数。  
 
+mark_canonical的工作主要是在batch中添加delete操作，write_buffered是将batch写入buffer，在适当的时候会有flush操作将buffer写入db中，journal_db.flush是清除juornabl_db内部的buffer，相当于clear操作。  
+
+
+## 总结
+上面描述了Parity中util目录下的所有DB，总结下来，给我的感觉是：Parity对DB的使用是非常充分的，代码中使用了很多的DB以及对DB的封装，几乎所有存储都提供了DB的抽象。这样的好处是：对于上层来说使用方便；不好的地方是：存储模型是较复杂的，有很多级的缓存。  
+如果我们充分掌握了DB的使用，也可以定制自己的DB。
