@@ -1,3 +1,5 @@
 # Parity_DB_learning
-please refer to parity_db_notes.md  
-请参看另一篇：parity_db_notes.md <对Parity DB的调研>
+这里记录一些我在阅读Parity源码的时候做的一些笔记。
+
+1. 对Parity DB的调研
+2. 对db.rs的学习
