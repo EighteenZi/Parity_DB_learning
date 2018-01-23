@@ -3,3 +3,4 @@
 
 1. 对Parity DB的调研
 2. 对db.rs的学习
+3. 对 cache_manager.rs的学习
