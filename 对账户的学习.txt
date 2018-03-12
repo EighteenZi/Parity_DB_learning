@@ -137,7 +137,7 @@ cache是db的cache，dirty是指cache与db不一致。
 
 6.总结一下
     总共3个缓存区域：storage_changes、storage_cache、code_cache。
-    先将storage。
+    先讲storage。
     storage_changes是个hashmap，保存着k和v；set_storage会将k、v放入storage_changes中；commit_storage会将数据从storage_changes中全部取出。
     storage_cache是个LruCache，能够自动进行删除操作，所以在代码中不会看到它的清理工作；storage_at如果是从db中获取的key，也会存入storage_cache中，不会在storage_changes中； \
         commit_storage会从取出storage_changes中的全部数据，以trie的形式插入到db中，并放入storage_cache中。
@@ -151,3 +151,5 @@ cache是db的cache，dirty是指cache与db不一致。
     代码里面很多地方判断code_cache是否失效了，有什么情况会导致code_cache的失效呢？可能是多次设置了code_cache。
         code判断code_cache是否失效，是的话返回None，否的话返回clone；note_code好像是跟code对应的，会再次设置code_cache和code_size；is_cached判断code_cache是否有效；
         cache_code会先判断code_cache是否有效，失效的话会从db中获取并放入code_cache和code_size；
+        
+    目前还留有1个疑问：会什么code_cache会失效？
