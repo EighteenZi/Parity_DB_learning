@@ -1,0 +1,153 @@
+account.rs
+这个文件从结构上看比较简单，但是非常重要、非常核心的文件，甚至可以是说整个系统最核心的几个文件之一。
+从名字上看，这个文件是关于“账户”的代码，是对“账户”的建模。账户的重要性可想而知。以太坊的本质就是记录账户与账户之间的交易，也就是说，账户是以太坊的基本主体， \
+从《以太坊的工作原理》这篇文章中看，账户是一个“对象”，有着自己的状态和方法，彼此之间通过“消息”进行通信，而世界状态就是由这一个个的对象--“账户”组成的。       \
+换句话说，以太坊世界中的活动主体就是这一个个的账户，没有其他的活物。这样一看，以太坊世界是如此的干净。感觉很像Java的面向对象思维。
+以太坊的账户分为:外部账户和合约账户，区别是外部账户没有code。
+下面来看一下以太坊具体对账户是怎样建模的。
+
+1.先从整体上看。在代码组织结构上，整个文件有：enum Filth，struct Account、impl From<BasicAccount> for Account, impl Account, impl Account, impl fmt::Debug for Account。
+Filth是Account里面表示账户状态的枚举体；BasicAccount是最基本的账户结构，这里实现了从BasicAccount到Account的转换；然后是2个impl Account，第1个是所有基本的方法，第2个是专为轻节点
+使用的方法；Debug是为了方便Account的打印。可以看出核心就只有一个：Account和它的方法。
+或者换一个角度来解释：Filth是Account内部的一个参数，From<BasicAccount>是Account的入，Debug是Account的出，struct Account和impl Account是Account的本体。
+
+2.Account本身
+```
+pub struct Account {
+    balance: U256,
+    nonce: u256,
+    storage_root: H256,
+    storage_cache: RefCell<LruCache<H256, H256>>,
+    storage_changes: HashMap<H256, H256>,
+    code_hash: H256,
+    code_size: Option<usize>,
+    code_cache: Arc<Bytes>,
+    code_filth: Filth,
+    address_hash: Cell<Option<H256>>,
+}
+````
+2.0 这里先穿插一下，讲一下BasicAccount，在basicaccount.rs文件中，这个文件很简单，就只包含一个结构体：
+```
+pub struct BasicAccount {
+    pub nonce: U256,
+    pub balance: U256,
+    pub storage_root: H256,
+    pub code_hash: H256,
+}
+```
+这个结构体是最基本的账户信息，也就是最关键的4个信息。
+
+根据BasicAccount可以看出Account的骨架，只是多了一些存储区域以及存储的状态：storage_changes, storage_cache, code_cache, code_filth, code_size，另外就是多了 \
+一个address_hash，目前暂时不知道这个项是怎么用的。
+
+但是，换句话说，这些存储区域和状态才是Account的本质存在意义！！！有了这些存储，Account才有了存在的意义，也就是说，Account的存在就是为了这几个存储区域。
+如果不要这几个存储区域，那么BasicAccount这个结构体完全可以胜任。所以说，之前一直感觉没搞清Account，就是没弄清这几个存储区域的本质，Account的方法大部分也是围绕着
+这几个存储区域展开的。
+
+2.1 而这个枚举
+```
+enum Filth {
+    Clean,
+    Dirty,
+}
+```
+是用在Account中表示code的状态的。
+
+2.2 impl From<BasicAccount> for Account 就是完成了2者的转换。
+具体实现就是
+将BasicAccount中的4项数据直接赋给Account，
+而那些存储区域都创建新的:
+    storage_cache: Self::empty_storage_cache(), 
+    storage_changes: HashMap::new(), 
+    code_cache: Arc::new(vec![]),
+那些状态都为新：
+    code_size: None,
+    code_filth: Filth::Clean,
+address_hash也为新：
+    address_hash: Cell::new(None),
+
+3. Account的方法
+impl Account是本文件最大篇幅的地方。有以下方法：
+    new:                    根据balance、nonce、storage、code生成新的Account
+    empty_storage_cache:    新建一个空的storage_cache，大小是8192
+    from_pod:               从PodAccount转换成Account。
+    new_basic:              根据balance、nonce生成新的Account
+    from_rlp:               RLP解出BasicAccount，然后通过From<BasicAccount>转换成Account
+    new_contract:           根据balance、nonce生成新的Account，与new_basic有些类似，但不相同
+    init_code:              添加code
+    reset_code:             与init_code等价
+    set_storage:            在storage_changes中插入新的key和value
+    storage_at:             调用cached_storage_at判断key是否在缓存中，没有的话去db中获取，并加入缓存中
+    cached_storage_at:      判断storage_changes和storage_cache中是否包含key
+    balance:                获取balance
+    nonce:                  获取nonce
+    code_hash:              获取code_hash
+    address_hash:           获取address_hash，如果为None，根据入参生成address_hash，并设置回去
+    code:                   获取code
+    code_size:              获取code_size
+    note_code:              感觉没啥用，好像是判断code的hash值与Account的hash值是否相等，相等的话就把code设置一下
+    is_cached:              判断code_cache是否有效
+    cache_code:             先判断code_cache是否有效，有效即返回code_cache；否则从db中获取code_cache
+    cache_given_code:       设置code_cache
+    cache_code_size：       判断是否有code_cache
+    storage_is_clean:       判断storage是否clean
+    is_empty:               
+    is_null:                判断balance、nonce、address_hash是否为空
+    is_basic:               判断code_hash是否为空
+    storage_root:           获取storage_root，如果clean就返回，否则返回None
+    storage_changes:        获取storage_changes
+    inc_nonce:              nonce加一
+    add_balance:            增加balance
+    sub_balance:            减少balance
+    commit_storage:         从storage_changes取出k、v，插入db中，并放入storage_cache中。最终结果是将storage_changes清空，
+    commit_code:            先判断code是否dirty，如果是clean的话不做操作；否则查看code_cache中是否有内容，有即插入db中，最后都设置为clean状态。
+    rlp:                    将nonce、balance、code_hash、storage_root进行rlp编码，这与from_rlp方法是对应的
+    clone_basic:            除了storage_changes和storage_cache之外，其他都clone
+    clone_dirty:            在clone_basic的基础上还clone  storage_changes
+    clone_all:              在clone_dirty的基础上还clone  storage_cache  
+    overwrite_with:         使用另一个Account替换掉本Account    
+
+涉及到存储区域的有以下几个方法：
+    init_code
+    reset_code
+    cache_given_code
+
+    set_storage
+    storage_at
+    cached_storage_at
+
+    commit_storage：
+    commit_code
+
+
+cache是db的cache，dirty是指cache与db不一致。
+涉及到db的方法有：
+    storage_at
+    cache_code
+    commit_storage
+    commit_code
+    
+4.Account轻节点的方法
+    prove_storage：验证key是否在storage中。方法是构造一个trie，然后在trie中get_with方法。
+    
+5.fmt::Debug
+    格式化打印输出。
+
+
+
+6.总结一下
+    总共3个缓存区域：storage_changes、storage_cache、code_cache。
+    先将storage。
+    storage_changes是个hashmap，保存着k和v；set_storage会将k、v放入storage_changes中；commit_storage会将数据从storage_changes中全部取出。
+    storage_cache是个LruCache，能够自动进行删除操作，所以在代码中不会看到它的清理工作；storage_at如果是从db中获取的key，也会存入storage_cache中，不会在storage_changes中； \
+        commit_storage会从取出storage_changes中的全部数据，以trie的形式插入到db中，并放入storage_cache中。
+    
+    再看code。
+    code_cache是个Vector。存储相关的方法有：
+        init_code、reset_code会设置code_cache；cache_given_code如果从db中获取的话，也会放入code_cache；commit_code的作用会将dirty的数据写入db。
+    
+    有哪些情况会将code_filth设置为dirty呢？new、from_pod、init_code
+
+    代码里面很多地方判断code_cache是否失效了，有什么情况会导致code_cache的失效呢？可能是多次设置了code_cache。
+        code判断code_cache是否失效，是的话返回None，否的话返回clone；note_code好像是跟code对应的，会再次设置code_cache和code_size；is_cached判断code_cache是否有效；
+        cache_code会先判断code_cache是否有效，失效的话会从db中获取并放入code_cache和code_size；
