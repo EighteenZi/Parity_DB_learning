@@ -1,0 +1,41 @@
+backend.rs
+这个文件从整体结构上看也不复杂，包括
+    trait Backend、
+	struct ProofCheck以及3个impl：impl ProofCheck、impl HashDB for ProofCheck、impl Backend for ProofCheck
+	struct Proving以及4个impl：impl HashDB for Proving、impl Backend for Proving、impl Proving、impl Clone for Proving
+	struct Basic和1个impl：impl Backend for Basic。
+从文件名称和代码内容上都可以看出，Backend trait是关键。
+Backend trait到底是做什么的呢？
+从文件头注释可以看出一些端倪。
+
+1.文件头注释：这个一个最小化的state backend的trait，是对数据来源的一种抽象，这些数据在blockchain state中会被用到。
+当前假定的存储系统结构是DB+Cache。
+
+backend，从字面上讲，是“后端”的意思，但是在parity中，back和backend一般都是代指存储系统。现在的存储系统结构就被假定为DB+Cache，
+大致浏览一下这个trait，就会发现操作单元是Address和Account，结合之前对account.rs的分析，这个trait就是要求存储结构需要实现的
+功能，能够接受Address和Account这个层面的数据，而这些数据都是blockchain state所需要的（之前分析过，state是由一个个的Account组成的）。
+
+简单来说，就是存储系统要为state提供基于Address和Account层面的存储需求，方便state的操作，或者说，backend就是为state服务的；
+另一方面，存储系统的架构也被设定为了DB+Cache。
+
+2.trait
+下面来看一下存储系统具体需要实现什么功能。
+    as_hashdb               :这个存储系统能够被当做hashdb来使用
+    as_hashdb_mut           :这个存储系统能够被当做可写的hashdb来使用，与as_hashdb的区别是可以存储数据
+    add_to_account_cache    :将一个账户放入存储系统的cache中，入参包括Address和Account
+    cache_code              :在global code cache中存储一个code，入参是code和hash值。看来存储系统的cache中还有code的cache。
+    get_cached_account      :从cache中获取一个Account，入参是Address
+    get_cached              :从cache中获取一个Account的数据，入参是Address和一个闭包，应该是根据Address找到Account之后调用闭包来获取数据
+    get_cached_code         :从global code cache中根据hash值获取code
+    note_non_null_account   :标记一个指定的Account为non-null，入参是Address
+    is_known_null           :判断一个Account是否为空
+
+3.struct ProofCheck
+    TODO
+    
+4.struct Proving
+    TODO
+
+5.struct Basic
+    TODO
+    
