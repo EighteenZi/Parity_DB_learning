@@ -1,0 +1,54 @@
+对bloom的学习
+布隆过滤器的知识可以从google上获取，简单来说，就是一种快速验证方法，能够验证某项是否在一个大的存储结构中，效率可以达到O(n)，但是随着存储项的增多，会存在一定的误差。
+bloom可以看做是一个位域和一系列hash函数，一个像存储的时候会进行hash，并将hash结果对应的位置为1.验证的时候进行hash，并查看相应位是否为1.一般会有多个hash。
+
+1.文件结构看起来比较简单，有：
+    struct BitVecJournal, impl BitVecJournal;
+    struct Bloom, impl Bloom,
+    struct BloomJournal.
+    下面一个个的看。
+    
+2.BitVecJournal
+    从结构体注释中可以看出是BitVec和Journal的结合，有记录的功能。
+    struct BitVecJournal {
+        elems: Vec<u64>,
+        journal:HashSet<usize>,
+    }
+    
+    impl BitVecJournal的方法有：
+    new         :构造器，入参是size，位的长度，
+    from_parts  :从一个引用来进行构造
+    set         :设置某一位为1，并在journal中记录是哪一个u64
+    get         :获取某一位是否为1
+    drain       :销毁器，销毁journal，并去除elems下的所有u64，返回
+    saturation  :饱和度，统计位为1的占比
+
+3. Bloom
+    pub struct Bloom {
+        bitmap: BitVecJournal,
+        bitmap_bits: u64,
+        k_num,
+    }
+    这是布隆过滤器的结构，但是没有太多注释，通过对方法的分析可以得出：bitmap就是上面的BitVecJournal，bitmap_bits是总的位数，k_num是hash的个数，也就是进行多少次hash。
+    
+    new                 :构造器，入参是bitmap_size，单位是字节数，和items_count，准备存储多少项。
+    from_parts          :构造器。
+    new_for_fp_rate     :构造器。根据项数和误报率，生成一个新的Bloom
+    compute_bitmap_size :计算bitmap的大小，根据项数和误报率
+    set                 :记录一个项。根据k_num次数调用sip_hash进行设置
+    check               :验证一个项。
+    number_of_bits      :获取位数
+    number_of_hash_functions:获取hash次数
+    optimal_k_num       :入参是位数和项数，根据一个算式，求出需要的hash数目，算式是m/n*(ln(2).ceil())
+    sip_hash            :用于计算出第一次hash的结果，即位号
+    bloom_hash          :用于计算出后续的位号
+    drain_journal       :销毁，注意是销毁BitVecJournal，返回一个BloomJournal
+    saturation          :饱和度，等于BitVecJournal的饱和度。
+    
+    主要与数据结构相关的方法是：set、check，两者相对应。
+    sip_hash和bloom_hash用于计算出设置的位号，两者配合使用。
+    
+4.BloomJournal
+    Bloom销毁后的返回结果。
+    
+    
